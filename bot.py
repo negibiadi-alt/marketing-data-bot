@@ -36,7 +36,7 @@ async def post_shutdown(application: Application) -> None:
     logger.info("Bot shut down.")
 
 
-def main() -> None:
+def build_app() -> Application:
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
@@ -70,9 +70,11 @@ def main() -> None:
     # Text message handler (catch-all, must be last)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    logger.info("Starting polling...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    return app
 
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.set_event_loop(asyncio.new_event_loop())
+    logger.info("Starting polling...")
+    build_app().run_polling(allowed_updates=Update.ALL_TYPES)
