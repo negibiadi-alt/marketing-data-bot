@@ -15,7 +15,7 @@ from config import GEMINI_API_KEY, MAX_HISTORY_TURNS
 logger = logging.getLogger(__name__)
 
 RATE_LIMIT_PER_MINUTE = 10
-MODEL_NAME = "gemini-2.0-flash"  # Free tier, fast
+MODEL_NAME = "gemini-1.5-flash"  # Free tier - 1500 istek/gün
 
 
 @dataclass
