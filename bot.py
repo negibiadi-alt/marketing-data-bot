@@ -16,7 +16,7 @@ from handlers.commands import (
     cmd_partners, cmd_stats, cmd_recent, cmd_search,
     cmd_delete, cmd_export,
 )
-from handlers.messages import handle_text, handle_callback
+from handlers.messages import handle_text, handle_callback, handle_new_partner_name
 from handlers.media import handle_photo, handle_photo_assign
 
 logging.basicConfig(
@@ -63,6 +63,9 @@ def main() -> None:
     # Callback query handlers (order matters)
     app.add_handler(CallbackQueryHandler(handle_photo_assign, pattern=r"^(assign_photo:|cancel_photo)"))
     app.add_handler(CallbackQueryHandler(handle_callback))
+
+    # Text: awaiting partner name input (checked before generic handler)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_new_partner_name), group=1)
 
     # Text message handler (catch-all, must be last)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
