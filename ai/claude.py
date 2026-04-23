@@ -6,15 +6,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Literal
 
-import google.generativeai as genai  # pip install google-generativeai
+from groq import AsyncGroq
 
 from database.queries import get_db_summary, get_partner_entries
-from config import GEMINI_API_KEY, MAX_HISTORY_TURNS
+from config import GROQ_API_KEY, MAX_HISTORY_TURNS
 
 logger = logging.getLogger(__name__)
 
 RATE_LIMIT_PER_MINUTE = 10
-MODEL_NAME = "gemini-1.5-flash"  # Free tier - 1500 istek/gün
+MODEL_NAME = "llama-3.1-8b-instant"  # Groq free tier — çok hızlı
 
 
 @dataclass
@@ -38,16 +38,16 @@ JSON formatı:
 }}
 
 Kurallar:
-- SAVE: Kullanıcı bir bilgi/not/link kaydetmek istiyor. İşbirlikçi hakkında bilgi veriyor, link atıyor, panel ss vs.
-- QUERY: Daha önce kaydedilen bir şeyi soruyor. "kimdi", "ne yapıyordu", "hangi sitede", "ne zaman", "hatırlıyor musun" gibi.
-- CHAT: Ne kaydetme ne sorgulama.
+- SAVE: Kullanıcı bir bilgi/not/link kaydetmek istiyor. İşbirlikçi hakkında bilgi veriyor, link atıyor vs.
+- QUERY: Daha önce kaydedilen bir şeyi soruyor. "kimdi", "ne yapıyordu", "hangi sitede", "ne zaman" gibi.
+- CHAT: Ne kaydetme ne sorgulama, genel sohbet.
 - partner: Kişi/firma/nick adı — varsa çıkar. Küçük harf, boşluk yerine "_". Yoksa null.
 - links: Mesajdaki tüm URL'ler. Boşsa [].
-- description: Link ve partner adı dışındaki bilgi. Yoksa null.
+- description: Link ve partner adı dışındaki bilgi metni. Yoksa null.
 
-Sadece JSON döndür, başka hiçbir şey yazma."""
+Sadece geçerli JSON döndür, başka hiçbir şey yazma."""
 
-SYSTEM_PROMPT = """Sen bir kişisel iş hafızasısın. Kullanıcı işbirlikçileri ve iş partnerlerini seninle takip ediyor.
+SYSTEM_PROMPT = """Sen bir kişisel iş hafızasısın. Kullanıcı işbirlikçilerini ve iş partnerlerini seninle takip ediyor.
 
 Veritabanı durumu (şu an):
 {db_summary}
@@ -61,12 +61,11 @@ Kurallar:
 - Linkler varsa tam URL yaz"""
 
 
-class GeminiAI:
+class GroqAI:
     def __init__(self) -> None:
-        genai.configure(api_key=GEMINI_API_KEY)
-        self._model = genai.GenerativeModel(MODEL_NAME)
-        # user_id -> ChatSession
-        self._sessions: dict[int, genai.ChatSession] = {}
+        self._client = AsyncGroq(api_key=GROQ_API_KEY)
+        # user_id -> list of {"role": ..., "content": ...}
+        self._history: dict[int, list[dict]] = {}
         # rate limiting
         self._rate: dict[int, list[datetime]] = {}
 
@@ -84,8 +83,13 @@ class GeminiAI:
         """Classify message intent and extract structured data."""
         try:
             prompt = INTENT_PROMPT.format(message=text)
-            response = await self._model.generate_content_async(prompt)
-            raw = response.text.strip()
+            response = await self._client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=256,
+            )
+            raw = response.choices[0].message.content.strip()
             raw = re.sub(r"^```(?:json)?\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
             data = json.loads(raw)
@@ -99,35 +103,33 @@ class GeminiAI:
             logger.warning("Intent classification failed: %s — fallback to CHAT", e)
             return Intent(type="CHAT")
 
-    def _get_session(self, user_id: int, system_instruction: str) -> genai.ChatSession:
-        if user_id not in self._sessions:
-            model = genai.GenerativeModel(
-                MODEL_NAME,
-                system_instruction=system_instruction,
-            )
-            self._sessions[user_id] = model.start_chat(history=[])
-        return self._sessions[user_id]
-
-    def reset_session(self, user_id: int) -> None:
-        self._sessions.pop(user_id, None)
-
     async def chat(self, user_id: int, username: str | None, message: str) -> str:
         if self._is_rate_limited(user_id):
             return "⏳ Çok hızlı sorgu gönderiyorsunuz. Lütfen bir dakika bekleyin."
         try:
             db_summary = await get_db_summary()
             system = SYSTEM_PROMPT.format(db_summary=db_summary)
-            session = self._get_session(user_id, system)
-            response = await session.send_message_async(message)
 
-            # Trim history to MAX_HISTORY_TURNS
-            if len(session.history) > MAX_HISTORY_TURNS * 2:
-                session.history = session.history[-(MAX_HISTORY_TURNS * 2):]
+            history = self._history.setdefault(user_id, [])
+            history.append({"role": "user", "content": message})
 
-            return response.text
+            response = await self._client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[{"role": "system", "content": system}] + history,
+                temperature=0.7,
+                max_tokens=1024,
+            )
+            reply = response.choices[0].message.content
+            history.append({"role": "assistant", "content": reply})
+
+            # Trim to MAX_HISTORY_TURNS
+            if len(history) > MAX_HISTORY_TURNS * 2:
+                self._history[user_id] = history[-(MAX_HISTORY_TURNS * 2):]
+
+            return reply
         except Exception as e:
-            logger.error("Gemini chat error for user %s: %s", user_id, e)
-            self.reset_session(user_id)
+            logger.error("Groq chat error for user %s: %s", user_id, e)
+            self._history.pop(user_id, None)
             return f"❌ AI yanıt verirken hata oluştu: {e}"
 
     async def summarize_partner(self, tag: str) -> str:
@@ -144,12 +146,17 @@ class GeminiAI:
             prompt = (
                 f"#{tag} iş partnerinin tüm kayıtlarını analiz et:\n\n"
                 + "\n".join(lines)
-                + "\n\nTürkçe, HTML formatlı özet yaz."
+                + "\n\nTürkçe, HTML formatlı özet yaz. "
+                "Ne zaman tanındı, hangi sitelerde çalışıyor, ne tür veriler var, önemli notlar."
             )
-            response = await self._model.generate_content_async(prompt)
-            return response.text
+            response = await self._client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1024,
+            )
+            return response.choices[0].message.content
         except Exception as e:
-            logger.error("Gemini summarize error for %s: %s", tag, e)
+            logger.error("Groq summarize error for %s: %s", tag, e)
             return f"❌ Analiz hatası: {e}"
 
     async def weekly_report(self) -> str:
@@ -165,12 +172,16 @@ class GeminiAI:
                 + "\n".join(lines)
                 + "\n\nTürkçe, HTML formatlı. En aktif partnerler, kim ne ekledi, trend."
             )
-            response = await self._model.generate_content_async(prompt)
-            return response.text
+            response = await self._client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1024,
+            )
+            return response.choices[0].message.content
         except Exception as e:
-            logger.error("Gemini weekly report error: %s", e)
+            logger.error("Groq weekly report error: %s", e)
             return f"❌ Rapor hatası: {e}"
 
 
 # Singleton
-ai = GeminiAI()
+ai = GroqAI()
